@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request, Form, HTTPException, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import create_engine, Column, String, TIMESTAMP, func, Integer, ForeignKey
+from sqlalchemy import create_engine, Column, String, TIMESTAMP, func, Integer, ForeignKey, and_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import IntegrityError
@@ -11,6 +11,7 @@ from dotenv import load_dotenv # 記得安裝 python-dotenv
 import requests
 import threading
 from datetime import datetime, timedelta
+from telegram_helper import send_telegram_async
 
 # 載入 .env 檔案
 load_dotenv()
@@ -61,6 +62,14 @@ class RegistrationSession(Base):
     expires_at = Column(TIMESTAMP(timezone=True), nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
+
+class UserCard(Base):
+    __tablename__ = "user_cards"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(String(20), ForeignKey("users.student_id"), nullable=False)
+    rfid_uid = Column(String(50), unique=True, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -71,21 +80,7 @@ def get_db():
         db.close()
 
 
-# --- Telegram helper ---
-TG_TOKEN = os.getenv("TG_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-
-def send_telegram(text: str):
-    if not TG_TOKEN or not TG_CHAT_ID:
-        print("[tg] TG_TOKEN or TG_CHAT_ID not set, skipping message")
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        resp = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text})
-        if resp.status_code != 200:
-            print(f"[tg] send failed: {resp.status_code} {resp.text}")
-    except Exception as e:
-        print(f"[tg] exception: {e}")
+# Telegram helper provided by telegram_helper.send_telegram_async
 
 
 def notify_pi_register_bg(student_id: str):
@@ -108,18 +103,19 @@ async def api_scan(request: Request, db: Session = Depends(get_db)):
     rfid_uid = data.get("rfid_uid")
     if not rfid_uid:
         return JSONResponse({"error": "missing rfid_uid"}, status_code=400)
-
-    user = db.query(User).filter(User.rfid_uid == rfid_uid).first()
-    if user:
-        log = AccessLog(student_id=user.student_id, rfid_uid=rfid_uid, action="entry")
-        db.add(log)
-        db.commit()
-        # Telegram 通知：有人進入
-        try:
-            send_telegram(f"你好！{user.name} 已進入 moli ({user.student_id})")
-        except Exception:
-            pass
-        return {"status": "allow", "student_id": user.student_id, "name": user.name}
+    # 先在 user_cards 中找 UID，支援一個使用者多張卡
+    card = db.query(UserCard).filter(UserCard.rfid_uid == rfid_uid).first()
+    if card:
+        user = db.query(User).filter(User.student_id == card.student_id).first()
+        if user:
+            log = AccessLog(student_id=user.student_id, rfid_uid=rfid_uid, action="entry")
+            db.add(log)
+            db.commit()
+            try:
+                send_telegram_async(f"你好！{user.name} 已進入 moli ({user.student_id})")
+            except Exception:
+                pass
+            return {"status": "allow", "student_id": user.student_id, "name": user.name}
 
     # 未註冊
     return {"status": "deny"}
@@ -171,7 +167,7 @@ async def api_register_scan(request: Request, db: Session = Depends(get_db)):
     # step 0 => 接受第一刷
     if session.step == 0:
         # 檢查此 UID 是否已被其他人綁定
-        other = db.query(User).filter(and_(User.rfid_uid == rfid_uid, User.student_id != student_id)).first()
+        other = db.query(UserCard).filter(and_(UserCard.rfid_uid == rfid_uid, UserCard.student_id != student_id)).first()
         if other:
             return JSONResponse({"error": "uid_already_bound", "bound_to": other.student_id}, status_code=400)
 
@@ -189,25 +185,27 @@ async def api_register_scan(request: Request, db: Session = Depends(get_db)):
     # step 1 => 驗證第二刷
     if session.step == 1:
         if session.first_uid == rfid_uid:
-            # 進行綁定
+            # 進行綁定（使用 user_cards 表以支援多張卡）
             user = db.query(User).filter(User.student_id == student_id).first()
             if not user:
                 return JSONResponse({"error": "user_not_found"}, status_code=404)
             # 再次檢查是否有人綁定過
-            other = db.query(User).filter(and_(User.rfid_uid == rfid_uid, User.student_id != student_id)).first()
+            other = db.query(UserCard).filter(and_(UserCard.rfid_uid == rfid_uid, UserCard.student_id != student_id)).first()
             if other:
                 db.delete(session)
                 db.commit()
                 return JSONResponse({"error": "uid_already_bound_after_check", "bound_to": other.student_id}, status_code=400)
 
-            user.rfid_uid = rfid_uid
+            # 新增 user_card 紀錄
+            new_card = UserCard(student_id=student_id, rfid_uid=rfid_uid)
+            db.add(new_card)
             db.add(AccessLog(student_id=student_id, rfid_uid=rfid_uid, action="bind"))
             # 刪除 session
             db.delete(session)
             db.commit()
             # Telegram 通知：綁定成功
             try:
-                send_telegram(f"綁定成功：{user.name} ({user.student_id}) 綁定卡號 {rfid_uid}")
+                send_telegram_async(f"綁定成功：{user.name} ({user.student_id}) 綁定卡號 {rfid_uid}")
             except Exception:
                 pass
             return {"status": "bound"}
@@ -239,7 +237,9 @@ async def register_post(
     existing_user = db.query(User).filter(User.student_id == student_id).first()
     if existing_user:
         # 如果用戶存在且已經有卡號，提示直接進門
-        if existing_user.rfid_uid:
+        # 檢查是否已有綁定卡片（user_cards）
+        existing_card = db.query(UserCard).filter(UserCard.student_id == student_id).first()
+        if existing_card:
              return templates.TemplateResponse(
                 "register.html",
                 {"request": request, "error": "❌ 學號已註冊且已綁定卡片，請直接使用。"},
@@ -250,7 +250,7 @@ async def register_post(
              db.commit()
              # 這裡不跳轉，而是回傳 200 讓前端 JS 處理顯示 Modal
              try:
-                 send_telegram(f"新用戶註冊（待綁定）：{name} ({student_id})")
+                 send_telegram_async(f"新用戶註冊（待綁定）：{name} ({student_id})")
              except Exception:
                  pass
              # 非同步通知 Pi 進入註冊模式（若 PI_API_URL 已設定）
@@ -264,7 +264,7 @@ async def register_post(
         db.commit()
         # 回傳 JSON 讓前端 JS 處理
         try:
-            send_telegram(f"新用戶註冊（待綁定）：{name} ({student_id})")
+            send_telegram_async(f"新用戶註冊（待綁定）：{name} ({student_id})")
         except Exception:
             pass
         # 非同步通知 Pi 進入註冊模式（若 PI_API_URL 已設定）
@@ -279,9 +279,15 @@ async def register_post(
 @app.get("/check_status/{student_id}")
 async def check_status(student_id: str, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.student_id == student_id).first()
-    if user and user.rfid_uid:
-        return {"bound": True, "rfid_uid": user.rfid_uid}
-    return {"bound": False}
+    if not user:
+        return {"bound": False}
+    cards = db.query(UserCard).filter(UserCard.student_id == student_id).all()
+    rfid_list = [c.rfid_uid for c in cards]
+    session = db.query(RegistrationSession).filter(RegistrationSession.student_id == student_id).first()
+    session_info = None
+    if session:
+        session_info = {"step": session.step, "expires_at": session.expires_at.isoformat() if session.expires_at else None}
+    return {"bound": len(rfid_list) > 0, "rfid_uids": rfid_list, "rfid_uid": rfid_list[0] if rfid_list else None, "registration_session": session_info}
 
 @app.get("/success", response_class=HTMLResponse)
 async def success_page(request: Request, student_id: str, db: Session = Depends(get_db)):
@@ -302,19 +308,21 @@ async def rfid_scan(
     if not user:
         raise HTTPException(status_code=404, detail="用戶不存在")
 
-    # 如果是用戶還沒綁定，這一次刷卡就是綁定
-    if not user.rfid_uid:
-        user.rfid_uid = rfid_uid
-        db.commit()
-        # 寫入 Log
-        log = AccessLog(student_id=student_id, rfid_uid=rfid_uid, action="bind")
-        db.add(log)
+    # 如果 action == 'bind'，執行綁定（支援多卡）
+    if action == 'bind':
+        existing = db.query(UserCard).filter(UserCard.rfid_uid == rfid_uid).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="RFID 已被其他使用者綁定")
+        new_card = UserCard(student_id=student_id, rfid_uid=rfid_uid)
+        db.add(new_card)
+        db.add(AccessLog(student_id=student_id, rfid_uid=rfid_uid, action="bind"))
         db.commit()
         return JSONResponse({"status": "success", "message": "綁定成功"})
-    
-    # 如果已綁定，檢查卡號是否相符
-    if user.rfid_uid != rfid_uid:
-         raise HTTPException(status_code=400, detail="RFID 與註冊資料不符")
+
+    # 其他 action（例如 entry）: 檢查卡號是否屬於該使用者
+    card = db.query(UserCard).filter(UserCard.rfid_uid == rfid_uid).first()
+    if not card or card.student_id != student_id:
+        raise HTTPException(status_code=400, detail="RFID 與註冊資料不符")
 
     log = AccessLog(student_id=student_id, rfid_uid=rfid_uid, action=action)
     db.add(log)
